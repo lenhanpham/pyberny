@@ -14,9 +14,9 @@ PyBerny is an optimizer of molecular geometries with respect to the total energy
 
 In each step, it takes energy and Cartesian gradients as an input, and returns a new equilibrium structure estimate.
 
-The package implements a single optimization algorithm, which is an amalgam of several techniques, comprising the quasi-Newton method, redundant internal coordinates, an iterative Hessian approximation, a trust region scheme, linear search, and coordinate weighting. The algorithm is described in more detail in the [documentation](https://jhrmnn.github.io/pyberny/master/algorithm.html).
+The package implements a single optimization algorithm, which is an amalgam of several techniques, comprising the quasi-Newton method, redundant internal coordinates, an iterative Hessian approximation, a trust region scheme, linear search, coordinate weighting, and transition state search (experimental). The algorithm is described in more detail in the [documentation](https://jhrmnn.github.io/pyberny/master/algorithm.html).
 
-Several desirable features are missing or incomplete at the moment, some of them being actively worked on (help is always welcome): [crystal geometries](https://github.com/jhrmnn/pyberny/issues/5), [coordinate constraints](https://github.com/jhrmnn/pyberny/issues/14), [coordinate weighting](https://github.com/jhrmnn/pyberny/issues/32), [transition state search](https://github.com/jhrmnn/pyberny/issues/4).
+Several desirable features are missing or incomplete at the moment, some of them being actively worked on (help is always welcome): [crystal geometries](https://github.com/jhrmnn/pyberny/issues/5), [coordinate constraints](https://github.com/jhrmnn/pyberny/issues/14), [coordinate weighting](https://github.com/jhrmnn/pyberny/issues/32).
 
 PyBerny is available in [PySCF](https://sunqm.github.io/pyscf/geomopt.html#pyberny) and [QCEngine](http://docs.qcarchive.molssi.org/projects/QCEngine/en/latest/index.html?highlight=pyberny#backends).
 
