@@ -12,3 +12,5 @@
 .claude/mopac/
 /mopac/
 /fort*
+*.pdf
+.env
