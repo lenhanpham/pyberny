@@ -43,6 +43,8 @@ class BernyParams:
         dihedral: whether to form dihedral angles.
         superweakdih: whether to form dihedral angles containing two or more
             noncovalent bonds.
+        transition_state: search for a first-order saddle point (P-RFO with
+            eigenvector following) instead of a minimum.
     """
 
     gradientmax: float = 0.45e-3
@@ -53,7 +55,7 @@ class BernyParams:
     energy_noise: float = 2e-8
     dihedral: bool = True
     superweakdih: bool = False
-    mode: str = 'min'
+    transition_state: bool = False
 
 
 class OptPoint(NamedTuple):
@@ -80,6 +82,7 @@ class BernyState:
     predicted: OptPoint | None = None
     previous: OptPoint | None = None
     best: OptPoint | None = None
+    ts_mode: FloatArray | None = None
 
 
 class BernyAdapter(logging.LoggerAdapter):  # type: ignore[type-arg]
@@ -136,11 +139,6 @@ class Berny(Generator):  # type: ignore[type-arg]
         if restart:
             self._state = BernyState(**restart)
             return
-        mode = params.get('mode', 'min')
-        if mode not in {'min', 'ts'}:
-            raise ValueError(
-                f"Invalid mode {mode!r}. Expected one of: 'min', 'ts'."
-            )
         bparams = BernyParams(**params)
         coords, H, weights, future = self._build_coord_state(geom, bparams)
         self._state = BernyState(
@@ -165,9 +163,15 @@ class Berny(Generator):  # type: ignore[type-arg]
         )
         for line in str(coords).split('\n'):
             self._log.info(line)
+        H = coords.hessian_guess(geom)
+        if params.transition_state:
+            # The model guess is positive-definite; seed a single negative
+            # curvature mode so P-RFO has a well-defined ascent direction from
+            # the first step.
+            H = init_ts_hessian(H, order=1, neg_value=-0.2)
         return (
             coords,
-            coords.hessian_guess(geom),
+            H,
             coords.weights(geom),
             OptPoint(coords.eval_geom(geom), None, None),
         )
@@ -199,16 +203,7 @@ class Berny(Generator):  # type: ignore[type-arg]
             record = {'step': self._n}
         else:
             record = None
-        result = energy_and_gradients
-        if len(result) == 2:
-            energy, gradients = result
-            cartesian_hessian = None
-        elif len(result) == 3:
-            energy, gradients, cartesian_hessian = result
-        else:
-            raise ValueError(
-                f"Solver output must be a 2-tuple or 3-tuple, got length {len(result)}."
-            )
+        energy, gradients = energy_and_gradients
         gradients = np.array(gradients)
         log(f'Energy: {energy:.12}')
         if record is not None:
@@ -246,66 +241,36 @@ class Berny(Generator):  # type: ignore[type-arg]
         current = OptPoint(s.future.q, energy, dot(B_inv.T, gradients.reshape(-1)))
         assert current.E is not None
         assert current.g is not None
-        if s.first and cartesian_hessian is not None:
-            n_atoms = len(s.geom)
-            expected_shape = (3 * n_atoms, 3 * n_atoms)
-            if np.array(cartesian_hessian).shape != expected_shape:
-                raise ValueError(
-                    f"cartesian_hessian has shape {np.array(cartesian_hessian).shape}, "
-                    f"expected {expected_shape}."
-                )
-            H_cart = np.array(cartesian_hessian)
-            H_int = B_inv.T @ H_cart @ B_inv
-            proj = B @ B_inv
-            n = len(s.coords)
-            H_proj = proj @ H_int @ proj + 1000 * (np.eye(n) - proj)
-            s.H = (H_proj + H_proj.T) / 2
-            _skip_hessian_update = True
-        else:
-            _skip_hessian_update = False
-        if s.first and s.params.mode == 'ts' and not _skip_hessian_update:
-            evals, evecs = np.linalg.eigh((s.H + s.H.T) / 2)
-            if evals.size > 0:
-                min_i = int(np.argmin(evals))
-                neg_val = -max(0.2, abs(float(evals[min_i])))
-                vec = evecs[:, min_i]
-                s.H = s.H + (neg_val - evals[min_i]) * np.outer(vec, vec)
         if not s.first:
             assert s.best is not None
             assert s.best.E is not None
             assert s.best.g is not None
             assert s.previous is not None
             assert s.previous.E is not None
-            assert s.previous.g is not None
             assert s.predicted is not None
             assert s.predicted.E is not None
             assert s.interpolated is not None
             assert s.interpolated.E is not None
-            if not _skip_hessian_update:
-                if s.params.mode == 'ts':
-                    # Fix 3: use the immediately preceding step as the secant
-                    # pair, and use the flowchart SR1/BFGS/PSB update that is
-                    # stable near saddle points (Birkholz & Schlegel 2016).
-                    s.H = update_hessian_ts(
-                        s.H,
-                        current.q - s.previous.q,
-                        current.g - s.previous.g,
-                        log=log,
-                        record=record,
-                    )
-                else:
-                    s.H = update_hessian(
-                        s.H,
-                        current.q - s.previous.q,
-                        current.g - s.previous.g,
-                        log=log,
-                        record=record,
-                    )
-
-        if not s.first and s.params.mode == 'ts' and self._n % 3 == 0:
-            s.H = ensure_one_negative_eigenvalue(s.H, 0.1)
-
-        if not s.first:
+            if s.params.transition_state:
+                # TS: secant pair from the immediately preceding accepted step
+                # and the saddle-point flowchart update (keeps one negative
+                # mode). No linear search: a saddle step legitimately raises the
+                # energy along the reaction coordinate.
+                s.H = update_hessian_ts(
+                    s.H,
+                    current.q - s.previous.q,
+                    current.g - s.previous.g,
+                    log=log,
+                    record=record,
+                )
+            else:
+                s.H = update_hessian(
+                    s.H,
+                    current.q - s.best.q,
+                    current.g - s.best.g,
+                    log=log,
+                    record=record,
+                )
             s.trust = update_trust(
                 s.trust,
                 current.E - s.previous.E,  # or should it be s.interpolated.E?
@@ -315,7 +280,9 @@ class Berny(Generator):  # type: ignore[type-arg]
                 energy_noise=s.params.energy_noise,
                 record=record,
             )
-            if s.params.mode == 'min':
+            if s.params.transition_state:
+                s.interpolated = current
+            else:
                 dq: FloatArray = s.best.q - current.q
                 t, E = linear_search(
                     current.E,
@@ -328,23 +295,26 @@ class Berny(Generator):  # type: ignore[type-arg]
                 s.interpolated = OptPoint(
                     current.q + t * dq, E, current.g + t * (s.best.g - current.g)
                 )
-            else:
-                s.interpolated = current
         else:
             s.interpolated = current
         if s.trust < 1e-6:
             raise RuntimeError('The trust radius got too small, check forces?')
         proj = dot(B, B_inv)
         H_proj = proj.dot(s.H).dot(proj) + 1000 * (eye(len(s.coords)) - proj)
-        H_proj = (H_proj + H_proj.T) / 2
-        H_proj = force_positive_definite(H_proj, 1e-4)
         assert s.interpolated.g is not None
-        if s.params.mode == 'ts':
-            dq, dE, on_sphere = quadratic_step_ts(
+        if s.params.transition_state:
+            # Periodically restore exactly one negative eigenvalue so the
+            # quasi-Newton updates do not drift away from the saddle-point
+            # signature, then take an eigenvector-following P-RFO step on the
+            # indefinite (NOT positive-definite) projected Hessian.
+            if not s.first and self._n % 3 == 0:
+                s.H = ensure_negative_eigenvalues(s.H, order=1, epsilon=0.1)
+                H_proj = proj.dot(s.H).dot(proj) + 1000 * (eye(len(s.coords)) - proj)
+            dq, dE, on_sphere, s.ts_mode = prfo_step(
                 dot(proj, s.interpolated.g),
                 H_proj,
-                s.weights,
                 s.trust,
+                ts_mode=s.ts_mode,
                 log=log,
                 record=record,
             )
@@ -372,38 +342,31 @@ class Berny(Generator):  # type: ignore[type-arg]
         )
         s.future = OptPoint(q, None, None)
         s.previous = current
-        # Fix 4: in TS mode always advance s.best (the TS point is higher in
-        # energy than the start; tracking by lowest energy would accumulate a
-        # reference from a nearby minimum and corrupt the Hessian secant).
-        if s.params.mode == 'ts' or s.first or (
+        # For a saddle-point search the "best" point always advances so the
+        # quasi-Newton secant pair uses the latest accepted step; for a
+        # minimization it tracks the lowest energy seen so far.
+        if s.params.transition_state or s.first or (
             s.best is not None and s.best.E is not None and current.E < s.best.E
         ):
             s.best = current
         s.first = False
-        if s.params.mode == 'ts':
-            # Fix 5: count negative eigenvalues from H_proj (redundant modes
-            # raised to +1000) rather than the raw s.H stored in the full
-            # redundant space which may carry spurious near-zero eigenvalues.
-            ev_H = np.linalg.eigvalsh(H_proj)
-            n_neg = int((ev_H < 0).sum())
-            self._converged = is_converged(
-                current.g,
-                s.future.q - current.q,
-                on_sphere,
-                s.params,
-                log=log,
-                record=record,
-                n_negative_eigenvalues=n_neg,
-            )
-        else:
-            self._converged = is_converged(
-                current.g,
-                s.future.q - current.q,
-                on_sphere,
-                s.params,
-                log=log,
-                record=record,
-            )
+        # A genuine first-order transition state must keep exactly one negative
+        # Hessian eigenvalue; require that signature before declaring TS
+        # convergence so the search does not stop at a minimum or higher-order
+        # saddle.
+        n_neg_ok = True
+        if s.params.transition_state:
+            n_neg = int((np.linalg.eigvalsh((H_proj + H_proj.T) / 2) < 0).sum())
+            n_neg_ok = n_neg == 1
+            log(f'* Negative eigenvalues (need 1 for TS): {n_neg}')
+        self._converged = n_neg_ok and is_converged(
+            current.g,
+            s.future.q - current.q,
+            on_sphere,
+            s.params,
+            log=log,
+            record=record,
+        )
         max_steps_reached = self._n == self._maxsteps
         if max_steps_reached:
             log('Maximum number of steps reached')
@@ -444,67 +407,18 @@ def update_hessian(
     *,
     record: dict[str, Any] | None = None,
 ) -> FloatArray:
-    yts = float(dot(dq, dg))
-    if yts > 0:
-        dH1 = dg[None, :] * dg[:, None] / yts
-        Hdq = H @ dq
-        dH2 = np.outer(Hdq, Hdq) / float(dot(dq, Hdq))
-        dH = dH1 - dH2
-        method = 'BFGS'
-    else:
-        z = dg - H @ dq
-        sts = float(dot(dq, dq))
-        if sts < 1e-20:
-            if record is not None:
-                record['hessian_update'] = {'method': 'PSB-skipped', 'reason': 'sts_too_small'}
-            return H
-        sz = float(dot(dq, z))
-        dH = (np.outer(dq, z) + np.outer(z, dq)) / sts - sz * np.outer(dq, dq) / (sts**2)
-        method = 'PSB'
+    dH1 = dg[None, :] * dg[:, None] / dot(dq, dg)
+    dH2 = H.dot(dq[None, :] * dq[:, None]).dot(H) / dq.dot(H).dot(dq)
+    dH = dH1 - dH2  # BFGS update
     log('Hessian update information:')
     rms_dH = Math.rms(dH)
     log(f'* Change: RMS: {rms_dH:.3}, max: {abs(dH).max():.3}')
     if record is not None:
         record['hessian_update'] = {
-            'method': method,
             'rms_change': float(rms_dH) if rms_dH is not None else None,
             'max_change': float(abs(dH).max()),
         }
     result: FloatArray = H + dH
-    return result
-
-
-def force_positive_definite(H: FloatArray, min_eigenvalue: float) -> FloatArray:
-    H_sym = (H + H.T) / 2
-    evals, evecs = np.linalg.eigh(H_sym)
-    evals = np.maximum(evals, min_eigenvalue)
-    H_pd = evecs @ np.diag(evals) @ evecs.T
-    result: FloatArray = H_pd
-    return result
-
-
-def ensure_one_negative_eigenvalue(H: FloatArray, epsilon: float) -> FloatArray:
-    evals, evecs = np.linalg.eigh((H + H.T) / 2)
-    if evals.size == 0:
-        return H
-    order = np.argsort(evals)
-    n_neg = int((evals < 0).sum())
-    H_new = H.copy()
-
-    i0 = int(order[0])
-    if n_neg != 1 or evals[i0] > -(epsilon / 2):
-        target = -epsilon
-        if evals[i0] > target:
-            vec = evecs[:, i0]
-            H_new = H_new + (target - evals[i0]) * np.outer(vec, vec)
-
-    for idx in order[1:]:
-        idx_i = int(idx)
-        if evals[idx_i] < epsilon / 2:
-            vec = evecs[:, idx_i]
-            H_new = H_new + (epsilon - evals[idx_i]) * np.outer(vec, vec)
-
-    result: FloatArray = H_new
     return result
 
 
@@ -516,61 +430,99 @@ def update_hessian_ts(
     *,
     record: dict[str, Any] | None = None,
 ) -> FloatArray:
-    """Flowchart Hessian update for TS search (Birkholz & Schlegel 2016, §2.2.1).
+    """Quasi-Newton Hessian update for transition-state search.
 
-    Near a saddle point the BFGS curvature condition y^T s > 0 is routinely
-    violated along the transition mode, making BFGS numerically unreliable.
-    The flowchart selects:
-      * SR1  when z^T s / (|z||s|) < −0.1  (quadratic error anti-parallel to step)
-      * BFGS when y^T s / (|y||s|) > +0.1  (curvature condition comfortably met)
-      * PSB  otherwise                       (always numerically stable fallback)
+    Uses the flowchart of Bofill / Anglada-Bofill (*J. Comput. Chem.* **1998**,
+    *19*, 349) selected from normalized cosine criteria so the model Hessian
+    keeps a single negative-curvature direction:
+
+    * SR1 when ``(z . s) / (|z| |s|) < -0.1``,
+    * BFGS when ``(y . s) / (|y| |s|) > +0.1``,
+    * PSB (symmetric rank-2) otherwise,
+
+    with ``s = dq``, ``y = dg`` and ``z = y - H s``.
     """
-    s = dq
+    s_vec = dq
     y = dg
-    z = y - H @ s  # quadratic error  z = Δg − H Δq
-    sts = float(dot(s, s))
+    z = y - H.dot(s_vec)
+    sts = float(dot(s_vec, s_vec))
     if sts < 1e-20:
-        log('TS Hessian update skipped: zero displacement')
-        if record is not None:
-            record['hessian_update'] = {'method': 'skipped', 'reason': 'zero_displacement'}
         return H
-    norm_z = float(norm(z))
-    norm_s = float(norm(s))
-    norm_y = float(norm(y))
-    zts_ratio = float(dot(z, s)) / (norm_z * norm_s + 1e-30)
-    yts_ratio = float(dot(y, s)) / (norm_y * norm_s + 1e-30)
+    norm_z = norm(z)
+    norm_s = norm(s_vec)
+    norm_y = norm(y)
+    zts_ratio = float(dot(z, s_vec)) / (norm_z * norm_s + 1e-30)
+    yts_ratio = float(dot(y, s_vec)) / (norm_y * norm_s + 1e-30)
     if zts_ratio < -0.1:
-        # SR1: most accurate when the quadratic error opposes the displacement
-        zts = float(dot(z, s))
+        zts = float(dot(z, s_vec))
         if abs(zts) < 1e-20:
-            log('SR1 update skipped: |z\u1d40s| too small, keeping H unchanged')
-            if record is not None:
-                record['hessian_update'] = {'method': 'skipped', 'reason': 'zts_too_small'}
             return H
-        dH = np.outer(z, z) / zts
+        dH = z[:, None] * z[None, :] / zts  # SR1
         method = 'SR1'
     elif yts_ratio > 0.1:
-        # BFGS: preferred when the curvature condition is well satisfied
-        yts = float(dot(y, s))
-        Hs = H @ s
-        dH = np.outer(y, y) / yts - np.outer(Hs, Hs) / float(s @ Hs)
+        yts = float(dot(y, s_vec))
+        Hs = H.dot(s_vec)
+        dH = y[:, None] * y[None, :] / yts - Hs[:, None] * Hs[None, :] / float(
+            dot(s_vec, Hs)
+        )  # BFGS
         method = 'BFGS'
     else:
-        # PSB: symmetric rank-2 fallback; numerically stable for any displacement
-        sz = float(dot(s, z))
-        dH = (np.outer(s, z) + np.outer(z, s)) / sts - sz * np.outer(s, s) / sts**2
+        sz = float(dot(s_vec, z))
+        dH = (
+            s_vec[:, None] * z[None, :] + z[:, None] * s_vec[None, :]
+        ) / sts - sz * s_vec[:, None] * s_vec[None, :] / (sts * sts)  # PSB
         method = 'PSB'
-    log(f'TS Hessian update ({method}):')
-    rms_dH = Math.rms(dH)
-    log(f'* Change: RMS: {rms_dH:.3}, max: {abs(dH).max():.3}')
+    log(f'TS Hessian update: {method}')
     if record is not None:
-        record['hessian_update'] = {
-            'method': method,
-            'rms_change': float(rms_dH) if rms_dH is not None else None,
-            'max_change': float(abs(dH).max()),
-        }
-    result: FloatArray = H + dH
-    return result
+        record['hessian_update'] = {'method': method}
+    return H + dH  # type: ignore[no-any-return]
+
+
+def ensure_negative_eigenvalues(
+    H: FloatArray, order: int = 1, epsilon: float = 0.1
+) -> FloatArray:
+    """Spectrally shift ``H`` to have exactly ``order`` negative eigenvalues.
+
+    Too few negative eigenvalues: the smallest positive ones are pushed to
+    ``-epsilon``. Too many: the least-negative ones are pushed to ``+epsilon``.
+    Keeps quasi-Newton updates from drifting away from the saddle-point
+    signature. Returns a symmetric matrix.
+    """
+    H = (H + H.T) / 2
+    b, V = np.linalg.eigh(H)
+    n = len(b)
+    if n == 0:
+        return H
+    n_neg = int((b < 0).sum())
+    if n_neg < order:
+        for k in range(min(order - n_neg, n)):
+            if b[k] > 0:
+                b[k] = -epsilon
+    elif n_neg > order:
+        flipped = 0
+        for k in range(n):
+            if n_neg - flipped <= order:
+                break
+            if b[k] < 0:
+                b[k] = epsilon
+                flipped += 1
+    return V.dot(np.diag(b)).dot(V.T)  # type: ignore[no-any-return]
+
+
+def init_ts_hessian(H: FloatArray, order: int = 1, neg_value: float = -0.2) -> FloatArray:
+    """Seed negative curvature along the ``order`` softest modes of ``H``.
+
+    Each of the ``order`` lowest eigenvalues is replaced with ``neg_value``
+    (which should be negative) so a transition-state search has a well-defined
+    ascent direction from the first step. Returns a symmetric matrix.
+    """
+    if order == 0 or H.shape[0] == 0:
+        return H
+    H = (H + H.T) / 2
+    b, V = np.linalg.eigh(H)
+    for k in range(min(order, len(b))):
+        b[k] = neg_value
+    return V.dot(np.diag(b)).dot(V.T)  # type: ignore[no-any-return]
 
 
 def _carry_over_hessian(
@@ -606,11 +558,9 @@ def update_trust(
     energy_noise: float = 2e-8,
     record: dict[str, Any] | None = None,
 ) -> float:
-    trust_min = 0.05
-    trust_max = 3.0
     if abs(dE_predicted) < 10 * energy_noise:
         if abs(norm(dq) - trust) < 1e-10:
-            new_trust = min(2 * trust, trust_max)
+            new_trust = 2 * trust
         else:
             new_trust = trust
         if record is not None:
@@ -631,7 +581,6 @@ def update_trust(
         new_trust = 2 * trust
     else:
         new_trust = trust
-    new_trust = max(trust_min, min(trust_max, float(new_trust)))
     if record is not None:
         record['trust_update'] = {
             'fletcher': float(r),
@@ -755,129 +704,127 @@ def quadratic_step(
     return dq, float(dE), on_sphere
 
 
-def quadratic_step_ts(
+def prfo_step(
     g: FloatArray,
     H: FloatArray,
-    w: FloatArray,
     trust: float,
+    ts_mode: FloatArray | None = None,
     log: Any = no_log,
     *,
     record: dict[str, Any] | None = None,
-) -> tuple[FloatArray, float, bool]:
-    """P-RFO quadratic step for transition state search (Schlegel 1982).
+) -> tuple[FloatArray, float, bool, FloatArray]:
+    """Partitioned rational-function-optimization (P-RFO) step.
 
-    Maximizes along the transition vector (lowest eigenvector of H) and
-    minimizes in the orthogonal complement.
+    Computes a first-order saddle-point step following Banerjee, Adams, Simons
+    and Shepard (*J. Phys. Chem.* **1985**, *89*, 52-57) with eigenvector
+    following. The Hessian eigenvectors are split into a one-dimensional
+    "ascent" subspace (the reaction coordinate) and the orthogonal "descent"
+    subspace:
 
-    Args:
-        g: gradient in internal coordinates (projected), shape (n,)
-        H: Hessian in internal coordinates (projected), shape (n, n)
-        w: coordinate weights, shape (n,) — reserved for future use
-        trust: trust radius
-        log: logging callable
-        record: optional dict for structured trace output
+    * The reaction-coordinate mode is shifted by the **upper** RFO root
+      ``nu_p = (b_p + sqrt(b_p**2 + 4 F_p**2)) / 2 >= b_p`` so the step climbs
+      that mode.
+    * Every remaining mode shares the **lower** RFO root ``nu_n``, the lowest
+      root of the secular equation ``nu = sum_i F_i**2 / (nu - b_i)`` over the
+      descent subspace, so those modes are minimized.
 
-    Returns:
-        (dq, dE, on_sphere) where dq is the step in internal coordinates,
-        dE is the predicted energy change, and on_sphere indicates whether
-        the step was rescaled to the trust sphere.
+    The component along eigenvector ``i`` is ``h_i = F_i / (nu - b_i)`` with
+    ``F_i = v_i . g``. The total step is scaled uniformly into ``trust`` if it
+    would otherwise exceed it.
+
+    ``ts_mode`` carries the reaction-coordinate eigenvector between cycles: the
+    ascended mode is the eigenvector of maximum overlap with ``ts_mode`` (or the
+    lowest mode when ``ts_mode`` is ``None``). The returned 4-tuple appends the
+    (sign-aligned) eigenvector that was climbed so the caller can keep following
+    the same reaction coordinate.
+
+    Returns ``(dq, dE, on_sphere, ts_mode)``.
     """
-    ev, V = np.linalg.eigh((H + H.T) / 2)  # ev ascending, V columns = eigenvectors
-    n = len(g)
+    H = (H + H.T) / 2
+    b, V = np.linalg.eigh(H)  # ascending eigenvalues, orthonormal columns
+    n = len(b)
+    F = V.T.dot(g)  # gradient in the eigenbasis
 
-    # Transition vector (lowest eigenvector) and orthogonal complement
-    v0 = V[:, 0]       # shape (n,)
-    V_rest = V[:, 1:]  # shape (n, n-1)
-
-    # --- Uphill RFO along transition vector ---
-    # 2×2 augmented matrix: M = [[ev[0], g0], [g0, 0]]
-    # Eigenvalues: μ_min < ev[0] < 0 < μ_max.
-    # The eigenvector for μ_max (index 1, highest eigenvalue) gives the
-    # maximisation (uphill) step t0 = V_ts[0,1] / V_ts[1,1].
-    # The eigenvector for μ_min (index 0) would give a downhill step — wrong.
-    g0 = float(v0 @ g)
-    rfo_ts = np.array([[ev[0], g0], [g0, 0.0]])
-    _D_ts, V_ts = np.linalg.eigh((rfo_ts + rfo_ts.T) / 2)
-    # index 1 = highest eigenvalue → uphill / maximisation direction
-    t0 = V_ts[0, 1] / V_ts[1, 1]
-
-    # --- Downhill RFO in orthogonal complement ---
-    g_rest = V_rest.T @ g                           # shape (n-1,)
-    rfo_rest = np.zeros((n, n))
-    rfo_rest[: n - 1, : n - 1] = np.diag(ev[1:])   # upper-left: diag(ev[1:])
-    rfo_rest[: n - 1, n - 1] = g_rest              # last column (upper part)
-    rfo_rest[n - 1, : n - 1] = g_rest              # last row (left part)
-    _D_rest, V_rest_rfo = np.linalg.eigh((rfo_rest + rfo_rest.T) / 2)
-    # eigenvector at index 0 → lowest eigenvalue → minimisation direction
-    t_rest = V_rest_rfo[: n - 1, 0] / V_rest_rfo[n - 1, 0]
-
-    # Assemble full step in original internal coordinate basis
-    dq = t0 * v0 + V_rest @ t_rest
-
-    # --- Trust radius constraint ---
-    # When the unconstrained pRFO step exceeds the trust radius we find the
-    # unique λ < ev[0] such that the pRFO step parameterised by λ has norm
-    # exactly equal to the trust radius.
-    #
-    # The Lagrangian stationarity conditions give:
-    #   t0(λ)      =  g0 / (ev[0] − λ)          [uphill:   same sign as g0]
-    #   t_rest_i(λ) = −g_rest_i / (ev[i] − λ)   [downhill: opposite sign to g_rest_i]
-    #
-    # With λ < ev[0] ≤ ev[1] ≤ …, all denominators are positive:
-    #   • t0     has the same sign as g0 → maximises energy along v0 ✓
-    #   • t_rest has the opposite sign to g_rest → minimises in the complement ✓
-    #
-    # The steplength function used for root-finding only needs ‖dq‖, so the
-    # minus sign on t_rest does not affect the root (‖−x‖ = ‖x‖).
-    step_norm = float(norm(dq))
-    if step_norm <= trust:
-        on_sphere = False
+    # Pick the reaction-coordinate (ascent) mode by maximum overlap with the
+    # tracked eigenvector; fall back to the lowest-curvature mode.
+    if ts_mode is not None and len(ts_mode) == n:
+        ascent = int(np.argmax(np.abs(V.T.dot(ts_mode))))
     else:
-        def _prfo_steplength(l: float) -> float:
-            t0_l = g0 / (ev[0] - l)
-            dq_l = t0_l * v0
-            if n > 1:
-                dq_l = dq_l + V_rest @ (g_rest / (ev[1:] - l))
-            return float(norm(dq_l)) - trust
+        ascent = 0
 
-        try:
-            l_opt = Math.findroot(_prfo_steplength, ev[0])
-            t0_s = g0 / (ev[0] - l_opt)
-            dq = t0_s * v0
-            if n > 1:
-                # Minus sign: downhill step opposes the gradient in each mode.
-                # Without it the constrained step would climb uphill in the
-                # orthogonal complement — opposite to the intended direction.
-                dq = dq + V_rest @ (-g_rest / (ev[1:] - l_opt))
-        except Math.FindrootError:
-            # Fallback: uniform radial rescaling (preserves pRFO direction)
-            dq = dq * trust / step_norm
+    # Upper RFO root for the ascended mode.
+    b_p = b[ascent]
+    F_p = F[ascent]
+    nu_p = 0.5 * (b_p + np.sqrt(b_p**2 + 4 * F_p**2))
+
+    # Lower RFO root for the descent subspace: lowest root of
+    # nu = sum_{i != ascent} F_i**2 / (nu - b_i), found by monotone bisection
+    # below the smallest descent eigenvalue.
+    descent = [i for i in range(n) if i != ascent]
+    if descent:
+        min_b = min(b[i] for i in descent)
+
+        def secular(nu: float) -> float:
+            return float(nu - sum(F[i] ** 2 / (nu - b[i]) for i in descent))
+
+        hi = min(min_b, 0.0) - 1e-9
+        lo = hi - 1.0
+        safety = 0
+        while secular(lo) > 0.0 and safety < 200:
+            lo -= abs(lo) + 1.0
+            safety += 1
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if secular(mid) > 0.0:
+                hi = mid
+            else:
+                lo = mid
+            if abs(hi - lo) < 1e-14 * (1 + abs(hi)):
+                break
+        nu_n = 0.5 * (lo + hi)
+    else:
+        nu_n = 0.0
+
+    # Step components h_i = F_i / (nu - b_i) in the eigenbasis.
+    h_eig = np.zeros(n)
+    for i in range(n):
+        nu = nu_p if i == ascent else nu_n
+        denom = nu - b[i]
+        if abs(denom) > 1e-14:
+            h_eig[i] = F[i] / denom
+    dq = V.dot(h_eig)
+
+    on_sphere = False
+    step_norm = norm(dq)
+    if step_norm > trust and step_norm > 1e-14:
+        dq = dq * (trust / step_norm)
         on_sphere = True
 
-    dE = float(dot(g, dq) + 0.5 * dq @ H @ dq)
+    # Update the tracked reaction coordinate (sign-aligned to the previous one).
+    tv = V[:, ascent].copy()
+    if ts_mode is not None and len(ts_mode) == n and dot(tv, ts_mode) < 0:
+        tv = -tv
 
-    log('P-RFO step (TS mode):')
-    log(f'* Trust radius: {trust:.2}')
-    log(f'* Number of negative eigenvalues: {(ev < 0).sum()}')
-    log(f'* Lowest eigenvalue (transition mode): {ev[0]:.3}')
-    log(f'* t0 (uphill coefficient): {t0:.3}')
+    dE = float(dot(g, dq) + 0.5 * dq.dot(H).dot(dq))
+    n_neg = int((b < 0).sum())
+    log(f'P-RFO step: ascent mode {ascent}, {n_neg} negative eigenvalue(s)')
+    log(f'* nu_p: {nu_p:.3}, nu_n: {nu_n:.3}')
     rms_dq = Math.rms(dq)
-    log(f'Quadratic step: RMS: {rms_dq:.3}, max: {max(abs(dq)):.3}')
     log(f'* Predicted energy change: {dE:.3}')
-
     if record is not None:
-        record['quadratic_step_ts'] = {
+        record['prfo_step'] = {
             'on_sphere': bool(on_sphere),
             'trust_radius': float(trust),
-            'n_negative_eigenvalues': int((ev < 0).sum()),
-            'lowest_eigenvalue': float(ev[0]),
-            't0': float(t0),
+            'ascent_mode': int(ascent),
+            'n_negative_eigenvalues': n_neg,
+            'lowest_eigenvalue': float(b[0]),
+            'nu_p': float(nu_p),
+            'nu_n': float(nu_n),
             'step_rms': float(rms_dq) if rms_dq is not None else None,
-            'step_max': float(max(abs(dq))),
-            'predicted_energy_change': float(dE),
+            'step_max': float(np.max(np.abs(dq))),
+            'predicted_energy_change': dE,
         }
-
-    return dq, dE, on_sphere
+    return dq, dE, on_sphere, tv
 
 
 def is_converged(
@@ -888,7 +835,6 @@ def is_converged(
     log: Any = no_log,
     *,
     record: dict[str, Any] | None = None,
-    n_negative_eigenvalues: int | None = None,
 ) -> bool:
     criteria: list[tuple[Any, ...]] = [
         ('Gradient RMS', Math.rms(forces), params.gradientrms),
@@ -903,9 +849,6 @@ def is_converged(
                 ('Step maximum', np.max(abs(step)), params.stepmax),
             ]
         )
-    if n_negative_eigenvalues is not None:
-        neg_ok = n_negative_eigenvalues == 1
-        criteria.append(('Single negative eigenvalue', neg_ok))
     log('Convergence criteria:')
     all_matched = True
     crit_records: list[dict[str, Any]] = []
